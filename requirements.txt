@@ -1,0 +1,40 @@
+# AIOS - Speech-Native AI Operating System
+# Python 3.11+
+
+# Core dependencies
+grpcio>=1.60.0
+grpcio-health-checking>=1.60.0
+protobuf>=4.25.0
+
+# Audio processing (Layer 1: Audio I/O Kernel)
+numpy>=1.24.0
+sounddevice>=0.4.6
+soxr>=0.3.0  # High-quality sample rate conversion
+
+# VAD (Voice Activity Detection)
+onnxruntime>=1.16.0  # For Silero VAD ONNX inference (CPU)
+
+# PyTorch for GPU/CPU inference (ASR, SLM, TTS)
+torch>=2.1.0
+
+# Optional: NVIDIA PersonaPlex SDK (uncomment when available)
+# personaplex-sdk>=1.0.0
+
+# Optional: Echo cancellation (uncomment preferred backend)
+# speexdsp>=0.4.0
+# webrtcvad>=2.0.10
+
+# Monitoring and logging
+structlog>=24.1.0
+prometheus-client>=0.20.0
+
+# Hot-word file watching
+watchdog>=4.0.0
+
+# Development dependencies
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-mock>=3.12.0
+black>=24.1.0
+mypy>=1.8.0
+ruff>=0.2.0
