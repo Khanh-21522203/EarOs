@@ -1,0 +1,67 @@
+# AIOS Main Configuration
+# Restart required for changes to take effect (except hot_words.json)
+
+audio:
+  capture_sample_rate: 16000
+  playback_sample_rate: 24000
+  frame_duration_ms: 20
+  ring_buffer_duration_s: 2.0
+  enable_aec: true
+
+vad:
+  use_silero: true
+  speech_threshold: 0.5
+  onset_frames: 3           # 60ms
+  offset_frames: 15          # 300ms
+  barge_in_frames: 5         # 100ms
+  energy_gate_dbfs: -50.0
+  calibration_duration_s: 2.0
+
+pipeline:
+  capture_queue_depth: 50
+  speech_queue_depth: 50
+  asr_queue_depth: 10
+  corrected_queue_depth: 10
+  prompt_queue_depth: 5
+  response_queue_depth: 20
+  playback_queue_depth: 50
+  thread_pool_workers: 3
+
+state_machine:
+  listening_timeout_s: 10.0
+  processing_timeout_s: 5.0
+  speaking_timeout_s: 30.0
+  interrupted_timeout_s: 0.5
+
+latency_targets:
+  turn_latency_ms: 500
+  barge_in_ms: 100
+  asr_first_partial_ms: 200
+  correction_ms: 80
+  slm_first_token_ms: 200
+  tts_first_frame_ms: 100
+
+degradation:
+  correction_hard_limit_ms: 140
+  slm_hard_limit_ms: 400
+  tts_hard_limit_ms: 200
+  consecutive_limit: 3
+  recovery_timer_s: 10
+
+context:
+  max_turns: 10
+  max_context_tokens: 2048
+  model_context_window: 4096
+  response_reserved_tokens: 1024
+
+logging:
+  level: INFO
+  json_format: true
+  non_blocking: true
+
+metrics:
+  port: 9090
+  enabled: true
+
+health:
+  port: 8080

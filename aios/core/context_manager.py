@@ -13,13 +13,17 @@ Performance constraints:
 - Memory footprint: <= 50MB for 10 turns with embeddings
 """
 
+import hashlib
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional, List
 from collections import deque
 
 logger = logging.getLogger(__name__)
+
+AIOS_DEBUG = os.environ.get("AIOS_DEBUG", "0") == "1"
 
 # Default token budget
 DEFAULT_MAX_TURNS = 10
@@ -34,20 +38,18 @@ class TurnRecord:
     """
     A single conversational turn.
 
-    Attributes:
-        role: "user" or "assistant"
-        text: The turn text content
-        timestamp: When this turn was recorded
-        interrupted: Whether this turn was interrupted (barge-in)
-        token_count: Pre-computed token count for this turn
-        turn_id: Unique turn identifier
+    From memory-and-persistence.md Section 2.1:
+        turn_id, role, text, raw_asr, timestamp, token_count,
+        interrupted, duration_ms
     """
     role: str  # "user" | "assistant"
     text: str
-    timestamp: float = field(default_factory=time.time)
+    raw_asr: str = ""           # Original ASR output before correction (user only)
+    timestamp: float = field(default_factory=time.monotonic)
     interrupted: bool = False
     token_count: int = 0
     turn_id: int = 0
+    duration_ms: float = 0.0    # Turn processing duration
 
     def __post_init__(self):
         if self.token_count == 0:
@@ -62,6 +64,13 @@ class TurnRecord:
         if not isinstance(self.timestamp, (int, float)):
             return False
         return True
+
+    def format_for_context(self) -> str:
+        """Format this turn for context injection per memory-and-persistence.md Section 4."""
+        role_label = "[User]" if self.role == "user" else "[Assistant]"
+        if self.interrupted:
+            return f"{role_label} [interrupted] {self.text}"
+        return f"{role_label} {self.text}"
 
 
 @dataclass
@@ -149,7 +158,15 @@ class ContextManager:
             f"(max_turns={max_turns}, max_tokens={max_context_tokens})"
         )
 
-    def add_turn(self, role: str, text: str, interrupted: bool = False, turn_id: int = 0) -> Optional[TurnRecord]:
+    def add_turn(
+        self,
+        role: str,
+        text: str,
+        interrupted: bool = False,
+        turn_id: int = 0,
+        raw_asr: str = "",
+        duration_ms: float = 0.0,
+    ) -> Optional[TurnRecord]:
         """
         Add a completed turn to the conversation history.
 
@@ -157,9 +174,11 @@ class ContextManager:
 
         Args:
             role: "user" or "assistant"
-            text: Turn text content
+            text: Turn text content (corrected for user turns)
             interrupted: Whether this turn was interrupted
             turn_id: Turn identifier from the state machine
+            raw_asr: Original ASR output before correction (user only)
+            duration_ms: Turn processing duration
 
         Returns:
             The TurnRecord if added, None if rejected.
@@ -167,8 +186,10 @@ class ContextManager:
         record = TurnRecord(
             role=role,
             text=text,
+            raw_asr=raw_asr,
             interrupted=interrupted,
             turn_id=turn_id or self._turn_counter,
+            duration_ms=duration_ms,
         )
 
         # Validate schema
@@ -193,10 +214,17 @@ class ContextManager:
         self._total_tokens += record.token_count
         self._turn_counter += 1
 
-        logger.debug(
-            f"Added turn: role={role}, tokens={record.token_count}, "
-            f"total_turns={len(self._turns)}, total_tokens={self._total_tokens}"
-        )
+        if AIOS_DEBUG:
+            logger.debug(
+                f"Added turn: role={role}, text={repr(text[:100])}, "
+                f"tokens={record.token_count}, total_turns={len(self._turns)}, "
+                f"total_tokens={self._total_tokens}"
+            )
+        else:
+            logger.debug(
+                f"Added turn: role={role}, tokens={record.token_count}, "
+                f"total_turns={len(self._turns)}, total_tokens={self._total_tokens}"
+            )
 
         return record
 
@@ -259,11 +287,25 @@ class ContextManager:
                 return turn.text
         return None
 
+    def mark_interrupted(self, turn_id: int) -> bool:
+        """Mark a specific turn as interrupted. O(N) scan."""
+        for turn in self._turns:
+            if turn.turn_id == turn_id:
+                turn.interrupted = True
+                logger.info(f"Turn {turn_id} marked as interrupted")
+                return True
+        return False
+
     def clear(self):
         """Clear all conversation history."""
         self._turns.clear()
         self._total_tokens = 0
         logger.info("Conversation history cleared")
+
+    def context_hash(self) -> str:
+        """Compute a hash of current context turns for cache invalidation."""
+        content = "|".join(f"{t.turn_id}:{t.role}:{t.text}" for t in self._turns)
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
 
     @property
     def turn_count(self) -> int:

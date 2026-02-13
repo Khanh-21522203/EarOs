@@ -88,6 +88,50 @@ from .core.pipeline import (
     create_pipeline,
 )
 
+from .interfaces.models import (
+    ASRModel,
+    SLMModel,
+    TTSModel,
+    ModelInfo,
+    ModelManager,
+    MockASRModel,
+    MockSLMModel,
+    MockTTSModel,
+)
+
+from .performance.latency import (
+    LatencyTracer,
+    LatencyHistogram,
+    TurnTrace,
+    Span,
+    LATENCY_TARGETS,
+)
+
+from .performance.degradation import (
+    DegradationManager,
+    DegradationLevel,
+)
+
+from .performance.metrics import (
+    MetricsCollector,
+    get_metrics,
+)
+
+from .debugging.logging_config import (
+    configure_logging,
+    ComponentLogger,
+    StructuredFormatter,
+)
+
+from .debugging.health import (
+    HealthCheckServer,
+    run_startup_probes,
+)
+
+from .debugging.audio_dump import (
+    AudioDumper,
+)
+
 from .infrastructure.streaming_client import (
     PersonaPlexStreamingClient,
     streaming_client,
@@ -169,6 +213,35 @@ __all__ = [
     "PipelineOrchestrator",
     "PipelineQueues",
     "create_pipeline",
+
+    # Model Abstractions
+    "ASRModel",
+    "SLMModel",
+    "TTSModel",
+    "ModelInfo",
+    "ModelManager",
+    "MockASRModel",
+    "MockSLMModel",
+    "MockTTSModel",
+
+    # Performance
+    "LatencyTracer",
+    "LatencyHistogram",
+    "TurnTrace",
+    "Span",
+    "LATENCY_TARGETS",
+    "DegradationManager",
+    "DegradationLevel",
+    "MetricsCollector",
+    "get_metrics",
+
+    # Debugging
+    "configure_logging",
+    "ComponentLogger",
+    "StructuredFormatter",
+    "HealthCheckServer",
+    "run_startup_probes",
+    "AudioDumper",
 
     # Infrastructure
     "PersonaPlexStreamingClient",

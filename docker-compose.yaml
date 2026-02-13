@@ -1,0 +1,72 @@
+version: "3.8"
+
+services:
+  aios:
+    build: .
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - /dev/snd:/dev/snd          # Audio device access (ALSA)
+      - ./models:/models:ro         # Model weights
+      - ./config:/config:ro         # Configuration
+    ports:
+      - "9090:9090"                 # Prometheus metrics
+      - "8080:8080"                 # Health check endpoint
+    environment:
+      - AIOS_CONFIG_DIR=/config
+      - AIOS_LOG_LEVEL=INFO
+      - AIOS_DEBUG=0
+      - AIOS_CAPTURE_DEVICE=default      # deployment.md §4.2
+      - AIOS_PLAYBACK_DEVICE=default      # deployment.md §4.2
+      - AIOS_METRICS_PORT=9090
+      - CUDA_VISIBLE_DEVICES=0
+    restart: unless-stopped
+    depends_on:
+      personaplex:
+        condition: service_healthy
+      riva-tts:
+        condition: service_healthy
+
+  personaplex:
+    image: nvcr.io/nvidia/personaplex:latest
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ports:
+      - "50051:50051"
+    healthcheck:
+      test: ["CMD", "grpc_health_probe", "-addr=:50051"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+
+  riva-tts:
+    image: nvcr.io/nvidia/riva/riva-speech:latest
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ports:
+      - "50052:50052"
+    healthcheck:
+      test: ["CMD", "grpc_health_probe", "-addr=:50052"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 30s

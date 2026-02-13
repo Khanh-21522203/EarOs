@@ -28,6 +28,9 @@ torch>=2.1.0
 structlog>=24.1.0
 prometheus-client>=0.20.0
 
+# Configuration
+pyyaml>=6.0.0  # YAML config file parsing (aios.yaml, models.yaml)
+
 # Hot-word file watching
 watchdog>=4.0.0
 

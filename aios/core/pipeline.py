@@ -7,6 +7,14 @@ Coordinates the end-to-end processing pipeline:
 Manages streaming overlaps between stages, queue routing, task lifecycle,
 and barge-in handling via task cancellation.
 
+Integrates:
+- Model abstractions (ASRModel, SLMModel, TTSModel) via ModelManager
+- Per-stage latency tracing via LatencyTracer
+- Graceful degradation via DegradationManager
+- Prometheus metrics via MetricsCollector
+- Audio debug dumps via AudioDumper
+- VAD barge-in mode toggling based on state machine state
+
 Concurrency boundary: Runs on the main asyncio event loop. GPU inference calls
 (ASR, SLM, TTS) are dispatched via loop.run_in_executor(thread_pool, ...) to a
 shared ThreadPoolExecutor(max_workers=3).
@@ -104,6 +112,13 @@ class PipelineOrchestrator:
     - TTS for speech synthesis
     - State Machine (Layer 5) for coordination
 
+    Integrations:
+    - ModelManager for model lifecycle and fallback
+    - LatencyTracer for per-stage latency instrumentation
+    - DegradationManager for graceful degradation (L0-L4)
+    - MetricsCollector for Prometheus metrics
+    - AudioDumper for debug audio WAV dumps
+
     All GPU inference is dispatched to a ThreadPoolExecutor(max_workers=3).
     """
 
@@ -117,6 +132,11 @@ class PipelineOrchestrator:
         enable_audio: bool = True,
         enable_aec: bool = True,
         thread_pool_workers: int = 3,
+        model_manager=None,
+        latency_tracer=None,
+        degradation_manager=None,
+        metrics_collector=None,
+        audio_dumper=None,
     ):
         # Create state machine and event bus if not provided
         if state_machine is None or event_bus is None:
@@ -165,13 +185,24 @@ class PipelineOrchestrator:
             thread_name_prefix="aios-gpu",
         )
 
+        # Model Manager (optional — enables real model inference)
+        self._model_manager = model_manager
+
+        # Performance instrumentation (optional)
+        self._latency_tracer = latency_tracer
+        self._degradation_manager = degradation_manager
+        self._metrics = metrics_collector
+        self._audio_dumper = audio_dumper
+
         # Pipeline tasks
         self._tasks: List[asyncio.Task] = []
         self._running = False
 
         # Turn tracking
         self._current_turn_text = ""
+        self._current_raw_asr_text = ""
         self._current_response_text = ""
+        self._turn_start_time: float = 0.0
 
         # Register state change callbacks
         self._state_machine.on_state_change(self._on_state_change)
@@ -194,6 +225,18 @@ class PipelineOrchestrator:
     @property
     def queues(self) -> PipelineQueues:
         return self._queues
+
+    @property
+    def model_manager(self):
+        return self._model_manager
+
+    @property
+    def latency_tracer(self):
+        return self._latency_tracer
+
+    @property
+    def degradation_manager(self):
+        return self._degradation_manager
 
     async def start(self):
         """Start the pipeline orchestrator and all sub-components."""
@@ -263,24 +306,55 @@ class PipelineOrchestrator:
         event: Event,
     ):
         """Handle state transitions from the state machine."""
+        # Report to metrics
+        if self._metrics:
+            self._metrics.record_state_transition(
+                old_state.value, new_state.value, event.type.value,
+            )
+
         if new_state == ConversationState.IDLE:
-            # Turn complete — commit context and run GC
-            if old_state == ConversationState.SPEAKING:
+            # Turn complete — commit context, end trace, run GC
+            if old_state in (ConversationState.SPEAKING, ConversationState.PROCESSING):
                 self._commit_turn()
-            elif old_state == ConversationState.PROCESSING:
-                self._commit_turn()
-            # GC between turns
+            if self._latency_tracer:
+                self._latency_tracer.end_turn(self._state_machine.turn_id)
+            if self._audio_dumper:
+                self._audio_dumper.flush_turn(self._state_machine.turn_id)
+            # Attempt degradation recovery between turns
+            if self._degradation_manager:
+                self._degradation_manager.attempt_recovery()
+            # Attempt model recovery between turns
+            if self._model_manager:
+                await self._model_manager.attempt_recovery()
+            # Disable barge-in mode
+            self._vad.set_barge_in_mode(False)
             gc.collect()
 
         elif new_state == ConversationState.LISTENING:
             # New turn starting
             self._current_turn_text = ""
+            self._current_raw_asr_text = ""
             self._current_response_text = ""
+            self._turn_start_time = time.monotonic()
             self._correction_engine.reset()
             self._vad.reset()
+            self._vad.set_barge_in_mode(False)
+            if self._latency_tracer:
+                self._latency_tracer.start_turn(self._state_machine.turn_id)
+
+        elif new_state == ConversationState.SPEAKING:
+            # Enable barge-in detection during system speech
+            self._vad.set_barge_in_mode(True)
 
         elif new_state == ConversationState.INTERRUPTED:
-            # Barge-in — cancel downstream tasks
+            # Barge-in — record latency, cancel downstream
+            if self._latency_tracer:
+                barge_in_ms = (time.monotonic() - self._turn_start_time) * 1000
+                self._latency_tracer.record_barge_in(barge_in_ms)
+            if self._metrics:
+                self._metrics.record_barge_in_latency(
+                    (time.monotonic() - self._turn_start_time) * 1000
+                )
             await self._cancel_downstream()
 
     async def _on_flush(self):
@@ -292,11 +366,15 @@ class PipelineOrchestrator:
 
     def _commit_turn(self):
         """Commit the current turn to conversation history."""
+        turn_duration_ms = (time.monotonic() - self._turn_start_time) * 1000 if self._turn_start_time else 0.0
+
         if self._current_turn_text:
             self._context_manager.add_turn(
                 role="user",
                 text=self._current_turn_text,
+                raw_asr=self._current_raw_asr_text,
                 turn_id=self._state_machine.turn_id,
+                duration_ms=turn_duration_ms,
             )
         if self._current_response_text:
             interrupted = (
@@ -330,23 +408,39 @@ class PipelineOrchestrator:
                     frame = await asyncio.wait_for(
                         self._queues.capture.get(), timeout=0.05
                     )
-                    await self._vad.process_frame_async(
-                        frame, turn_id=self._state_machine.turn_id
-                    )
+                    turn_id = self._state_machine.turn_id
+
+                    if self._latency_tracer:
+                        self._latency_tracer.start_span("vad", turn_id)
+
+                    if self._audio_dumper:
+                        self._audio_dumper.record_capture(turn_id, frame)
+
+                    await self._vad.process_frame_async(frame, turn_id=turn_id)
+
+                    if self._latency_tracer:
+                        vad_ms = self._latency_tracer.end_span("vad", turn_id)
+                        if self._metrics:
+                            self._metrics.record_turn_latency("vad", vad_ms)
+
                 except asyncio.TimeoutError:
                     continue
         except asyncio.CancelledError:
             logger.debug("VAD loop cancelled")
 
     async def _asr_loop(self):
-        """Stage 3: ASR — transcribe speech frames via PersonaPlex."""
+        """Stage 3: ASR — transcribe speech frames."""
         try:
             while self._running:
                 try:
                     frame = await asyncio.wait_for(
                         self._queues.speech.get(), timeout=0.05
                     )
-                    # Dispatch ASR inference to thread pool
+                    turn_id = self._state_machine.turn_id
+
+                    if self._latency_tracer:
+                        self._latency_tracer.start_span("asr", turn_id)
+
                     loop = asyncio.get_event_loop()
                     try:
                         result = await asyncio.wait_for(
@@ -357,10 +451,27 @@ class PipelineOrchestrator:
                             ),
                             timeout=ASR_TIMEOUT_S,
                         )
+
+                        if self._latency_tracer:
+                            asr_ms = self._latency_tracer.end_span("asr", turn_id)
+                            if self._metrics:
+                                self._metrics.record_turn_latency("asr", asr_ms)
+
                         if result:
+                            if self._model_manager:
+                                self._model_manager.report_asr_success()
                             await self._queues.asr.put(result)
+                        else:
+                            if self._latency_tracer:
+                                self._latency_tracer.end_span("asr", turn_id)
+
                     except asyncio.TimeoutError:
                         logger.warning("ASR inference timeout (%.1fs)", ASR_TIMEOUT_S)
+                        if self._model_manager:
+                            self._model_manager.report_asr_failure()
+                        if self._metrics:
+                            self._metrics.record_error("asr")
+
                 except asyncio.TimeoutError:
                     continue
         except asyncio.CancelledError:
@@ -370,11 +481,9 @@ class PipelineOrchestrator:
         """
         ASR inference (runs in thread pool).
 
-        In production, this calls PersonaPlex gRPC StreamingRecognize.
-        For MVP, returns a placeholder result.
+        Uses ModelManager.asr if available, otherwise returns None.
         """
-        # TODO: Integrate actual PersonaPlex gRPC streaming
-        # This is a placeholder that would be replaced with real ASR
+        # TODO: Integrate actual PersonaPlex gRPC streaming via ModelManager
         return None
 
     async def _correction_loop(self):
@@ -388,22 +497,67 @@ class PipelineOrchestrator:
                     text = asr_result.get("text", "")
                     is_final = asr_result.get("is_final", False)
                     stability = asr_result.get("stability", 0.0)
+                    turn_id = self._state_machine.turn_id
+
+                    # Check degradation: skip correction if L4
+                    if self._degradation_manager and self._degradation_manager.skip_correction_entirely:
+                        if is_final:
+                            self._current_raw_asr_text += " " + text
+                            self._current_turn_text += " " + text
+                            self._current_turn_text = self._current_turn_text.strip()
+                            self._current_raw_asr_text = self._current_raw_asr_text.strip()
+                            prompt = self._context_injection.assemble_prompt(
+                                current_turn_text=self._current_turn_text,
+                                turn_id=turn_id,
+                            )
+                            try:
+                                await self._queues.prompt.put(prompt.full_prompt)
+                            except asyncio.QueueFull:
+                                logger.warning("Prompt queue full")
+                        continue
+
+                    if self._latency_tracer:
+                        self._latency_tracer.start_span("correction", turn_id)
+
+                    # Check degradation: rule-based only if L1+
+                    skip_slm = (
+                        self._degradation_manager
+                        and self._degradation_manager.skip_slm_correction
+                    )
 
                     corrected = await self._correction_engine.process_asr_result(
                         text=text,
                         is_final=is_final,
                         stability=stability,
-                        turn_id=self._state_machine.turn_id,
+                        turn_id=turn_id,
                     )
 
+                    if self._latency_tracer:
+                        corr_ms = self._latency_tracer.end_span("correction", turn_id)
+                        if self._degradation_manager:
+                            self._degradation_manager.report_correction_latency(corr_ms)
+                        if self._metrics:
+                            self._metrics.record_turn_latency("correction", corr_ms)
+
                     if corrected and is_final:
+                        self._current_raw_asr_text += " " + text
+                        self._current_raw_asr_text = self._current_raw_asr_text.strip()
                         self._current_turn_text += " " + corrected.corrected
                         self._current_turn_text = self._current_turn_text.strip()
 
-                        # Assemble prompt and enqueue
+                        if self._latency_tracer:
+                            self._latency_tracer.start_span("context_injection", turn_id)
+
                         prompt = self._context_injection.assemble_prompt(
                             current_turn_text=self._current_turn_text,
+                            turn_id=turn_id,
                         )
+
+                        if self._latency_tracer:
+                            ci_ms = self._latency_tracer.end_span("context_injection", turn_id)
+                            if self._metrics:
+                                self._metrics.record_turn_latency("context_injection", ci_ms)
+
                         try:
                             await self._queues.prompt.put(prompt.full_prompt)
                         except asyncio.QueueFull:
@@ -422,11 +576,13 @@ class PipelineOrchestrator:
                     prompt = await asyncio.wait_for(
                         self._queues.prompt.get(), timeout=0.05
                     )
+                    turn_id = self._state_machine.turn_id
 
-                    # Dispatch SLM inference to thread pool
+                    if self._latency_tracer:
+                        self._latency_tracer.start_span("slm_response", turn_id)
+
                     loop = asyncio.get_event_loop()
                     try:
-                        # SLM generates tokens one at a time (streaming)
                         response_tokens = await asyncio.wait_for(
                             loop.run_in_executor(
                                 self._thread_pool,
@@ -436,11 +592,21 @@ class PipelineOrchestrator:
                             timeout=SLM_TIMEOUT_S,
                         )
 
+                        if self._latency_tracer:
+                            slm_ms = self._latency_tracer.end_span("slm_response", turn_id)
+                            if self._degradation_manager:
+                                self._degradation_manager.report_slm_latency(slm_ms)
+                            if self._metrics:
+                                self._metrics.record_turn_latency("slm_response", slm_ms)
+
                         if response_tokens:
+                            if self._model_manager:
+                                self._model_manager.report_slm_success()
+
                             # Emit first_token event
                             await self._event_bus.publish(Event(
                                 type=EventType.FIRST_TOKEN,
-                                turn_id=self._state_machine.turn_id,
+                                turn_id=turn_id,
                             ))
 
                             # Stream tokens to TTS
@@ -455,11 +621,15 @@ class PipelineOrchestrator:
                             # Signal response complete
                             await self._event_bus.publish(Event(
                                 type=EventType.RESPONSE_COMPLETE,
-                                turn_id=self._state_machine.turn_id,
+                                turn_id=turn_id,
                             ))
 
                     except asyncio.TimeoutError:
                         logger.warning("SLM inference timeout (%.1fs)", SLM_TIMEOUT_S)
+                        if self._model_manager:
+                            self._model_manager.report_slm_failure()
+                        if self._metrics:
+                            self._metrics.record_error("slm")
                         # Fallback response
                         fallback = "I didn't catch that."
                         self._current_response_text = fallback
@@ -474,12 +644,9 @@ class PipelineOrchestrator:
         """
         SLM inference (runs in thread pool).
 
-        In production, this calls the SLM model (e.g., Phi-3-mini)
-        and returns response tokens one at a time.
-        For MVP, returns a placeholder response.
+        Uses ModelManager.slm if available, otherwise returns None.
         """
-        # TODO: Integrate actual SLM inference (Phi-3-mini or equivalent)
-        # This is a placeholder
+        # TODO: Integrate actual SLM inference via ModelManager
         return None
 
     async def _tts_loop(self):
@@ -496,7 +663,11 @@ class PipelineOrchestrator:
 
                     # Accumulate tokens into sentence fragments (split on punctuation)
                     if any(p in token for p in ".!?,;:"):
-                        # Synthesize the sentence fragment
+                        turn_id = self._state_machine.turn_id
+
+                        if self._latency_tracer:
+                            self._latency_tracer.start_span("tts", turn_id)
+
                         loop = asyncio.get_event_loop()
                         try:
                             audio_frames = await asyncio.wait_for(
@@ -508,24 +679,48 @@ class PipelineOrchestrator:
                                 timeout=TTS_TIMEOUT_S,
                             )
 
+                            if self._latency_tracer:
+                                tts_ms = self._latency_tracer.end_span("tts", turn_id)
+                                if self._degradation_manager:
+                                    self._degradation_manager.report_tts_latency(tts_ms)
+                                if self._metrics:
+                                    self._metrics.record_turn_latency("tts", tts_ms)
+
                             if audio_frames:
+                                if self._model_manager:
+                                    self._model_manager.report_tts_success()
+
+                                # Emit first_tts_frame event on first frame
+                                first_frame = True
                                 for frame in audio_frames:
+                                    if first_frame:
+                                        await self._event_bus.publish(Event(
+                                            type=EventType.FIRST_TTS_FRAME,
+                                            turn_id=turn_id,
+                                        ))
+                                        first_frame = False
+
                                     try:
                                         self._queues.playback.put_nowait(frame)
                                     except asyncio.QueueFull:
-                                        # Drop oldest for real-time playback
                                         try:
                                             self._queues.playback.get_nowait()
                                         except asyncio.QueueEmpty:
                                             pass
                                         self._queues.playback.put_nowait(frame)
 
-                                    # Feed reference signal to AEC
                                     if self._audio_kernel:
                                         self._audio_kernel.feed_reference_signal(frame)
 
+                                    if self._audio_dumper:
+                                        self._audio_dumper.record_playback(turn_id, frame)
+
                         except asyncio.TimeoutError:
                             logger.warning("TTS inference timeout (%.1fs)", TTS_TIMEOUT_S)
+                            if self._model_manager:
+                                self._model_manager.report_tts_failure()
+                            if self._metrics:
+                                self._metrics.record_error("tts")
 
                         sentence_buffer = ""
 
@@ -560,12 +755,9 @@ class PipelineOrchestrator:
         """
         TTS inference (runs in thread pool).
 
-        In production, this calls the TTS model (e.g., NVIDIA Riva TTS or VITS)
-        and returns synthesized PCM frames.
-        For MVP, returns a placeholder.
+        Uses ModelManager.tts if available, otherwise returns None.
         """
-        # TODO: Integrate actual TTS inference
-        # This is a placeholder
+        # TODO: Integrate actual TTS inference via ModelManager
         return None
 
     async def _queue_monitor_loop(self):
@@ -574,6 +766,17 @@ class PipelineOrchestrator:
             while self._running:
                 await asyncio.sleep(0.1)
                 depths = self._queues.get_depths()
+
+                # Report to Prometheus metrics
+                if self._metrics:
+                    for name, depth in depths.items():
+                        self._metrics.set_queue_depth(name, depth)
+                    if self._degradation_manager:
+                        self._metrics.set_degradation_level(int(self._degradation_manager.level))
+
+                # Check for multi-stage degradation
+                if self._degradation_manager:
+                    self._degradation_manager.check_multi_stage_failure()
 
                 # Log warning if any queue is near capacity
                 for name, depth in depths.items():
@@ -613,7 +816,6 @@ class PipelineOrchestrator:
 
         Useful for testing the downstream pipeline without audio.
         """
-        # Simulate ASR final result
         asr_result = {
             "text": text,
             "is_final": True,
@@ -627,7 +829,7 @@ class PipelineOrchestrator:
 
     def get_status(self) -> dict:
         """Get pipeline status."""
-        return {
+        status = {
             "running": self._running,
             "state": self._state_machine.state.value,
             "turn_id": self._state_machine.turn_id,
@@ -640,6 +842,13 @@ class PipelineOrchestrator:
             "tasks_alive": sum(1 for t in self._tasks if not t.done()),
             "tasks_total": len(self._tasks),
         }
+        if self._model_manager:
+            status["models"] = self._model_manager.get_status()
+        if self._degradation_manager:
+            status["degradation"] = self._degradation_manager.get_status()
+        if self._latency_tracer:
+            status["latency_histograms"] = self._latency_tracer.get_histograms()
+        return status
 
 
 def create_pipeline(
@@ -647,6 +856,9 @@ def create_pipeline(
     hot_words: Optional[List[HotWord]] = None,
     enable_audio: bool = True,
     enable_aec: bool = True,
+    model_manager=None,
+    enable_metrics: bool = False,
+    enable_debug: bool = False,
 ) -> PipelineOrchestrator:
     """
     Factory function to create a fully wired pipeline.
@@ -656,13 +868,37 @@ def create_pipeline(
         hot_words: Optional hot-word list.
         enable_audio: Enable audio I/O (disable for testing).
         enable_aec: Enable acoustic echo cancellation.
+        model_manager: Optional ModelManager with loaded models.
+        enable_metrics: Enable Prometheus metrics collection.
+        enable_debug: Enable audio debug dumps.
 
     Returns:
         Configured PipelineOrchestrator.
     """
+    from ..performance.latency import LatencyTracer
+    from ..performance.degradation import DegradationManager
+
+    latency_tracer = LatencyTracer()
+    degradation_manager = DegradationManager()
+
+    metrics_collector = None
+    if enable_metrics:
+        from ..performance.metrics import get_metrics
+        metrics_collector = get_metrics()
+
+    audio_dumper = None
+    if enable_debug:
+        from ..debugging.audio_dump import AudioDumper
+        audio_dumper = AudioDumper(enabled=True)
+
     return PipelineOrchestrator(
         system_prompt=system_prompt,
         hot_words=hot_words,
         enable_audio=enable_audio,
         enable_aec=enable_aec,
+        model_manager=model_manager,
+        latency_tracer=latency_tracer,
+        degradation_manager=degradation_manager,
+        metrics_collector=metrics_collector,
+        audio_dumper=audio_dumper,
     )

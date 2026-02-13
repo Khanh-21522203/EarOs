@@ -6,9 +6,11 @@ Main entry point. Initializes the 5-layer pipeline and runs the
 real-time speech-to-speech interaction loop.
 
 Usage:
-    python main.py                    # Run with audio hardware
-    python main.py --no-audio         # Run without audio (testing mode)
-    python main.py --hot-words hw.json  # Load hot-words from file
+    python main.py                        # Run with audio hardware
+    python main.py --no-audio             # Run without audio (testing mode)
+    python main.py --hot-words hw.json    # Load hot-words from file
+    python main.py --metrics              # Enable Prometheus metrics on :9090
+    python main.py --debug                # Enable debug mode (audio dumps, verbose logs)
 """
 
 import argparse
@@ -16,6 +18,7 @@ import asyncio
 import gc
 import json
 import logging
+import os
 import signal
 import sys
 from pathlib import Path
@@ -23,13 +26,10 @@ from pathlib import Path
 from aios.core.pipeline import PipelineOrchestrator, create_pipeline
 from aios.core.context_injection import HotWord
 from aios.core.state_machine import ConversationState
+from aios.debugging.logging_config import configure_logging
+from aios.debugging.health import HealthCheckServer, run_startup_probes
+from aios.performance.metrics import get_metrics
 
-# Configure structured logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
 logger = logging.getLogger("aios.main")
 
 
@@ -55,23 +55,42 @@ def parse_args() -> argparse.Namespace:
         "--system-prompt",
         type=str,
         default=None,
-        help="Custom system prompt for the SLM",
+        help="Path to system prompt text file or inline prompt",
     )
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Enable debug logging",
+        help="Enable debug mode (audio dumps, verbose logging)",
+    )
+    parser.add_argument(
+        "--metrics",
+        action="store_true",
+        help="Enable Prometheus metrics server on :9090",
+    )
+    parser.add_argument(
+        "--health-port",
+        type=int,
+        default=8080,
+        help="Health check server port (default: 8080)",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to aios.yaml config file",
     )
     return parser.parse_args()
 
 
 def load_hot_words(path: str) -> list[HotWord]:
-    """Load hot-words from a JSON file."""
+    """Load hot-words from a JSON file (array of {term, phonetic_variants})."""
     try:
         with open(path, "r") as f:
             data = json.load(f)
         hot_words = []
-        for entry in data.get("hot_words", []):
+        # Support both array format and {hot_words: [...]} format
+        entries = data if isinstance(data, list) else data.get("hot_words", [])
+        for entry in entries:
             hot_words.append(HotWord(
                 term=entry["term"],
                 phonetic_variants=entry.get("phonetic_variants", []),
@@ -83,27 +102,64 @@ def load_hot_words(path: str) -> list[HotWord]:
         return []
 
 
+def load_system_prompt(path_or_text: str) -> str:
+    """Load system prompt from file or return as-is if not a file path."""
+    p = Path(path_or_text)
+    if p.exists() and p.is_file():
+        return p.read_text().strip()
+    return path_or_text
+
+
 def configure_gc():
     """Configure garbage collector for real-time audio performance."""
-    # Disable generation 2 GC to prevent long pauses during active conversation
     gc.set_threshold(700, 10, 0)
     logger.info("GC configured: threshold=(700, 10, 0)")
 
 
 async def run_pipeline(args: argparse.Namespace):
     """Initialize and run the AIOS pipeline."""
-    # Load hot-words if specified
+    # Run startup probes
+    probes = run_startup_probes(
+        require_gpu=not args.no_audio,
+        require_audio=not args.no_audio,
+    )
+    logger.info("Startup probes: %s", probes)
+
+    # Load hot-words
     hot_words = None
     if args.hot_words:
         hot_words = load_hot_words(args.hot_words)
 
+    # Load system prompt
+    system_prompt = None
+    if args.system_prompt:
+        system_prompt = load_system_prompt(args.system_prompt)
+
+    # Set debug env var if --debug flag
+    if args.debug:
+        os.environ["AIOS_DEBUG"] = "1"
+
+    # Enable metrics
+    if args.metrics:
+        metrics = get_metrics()
+        metrics.start_server()
+
     # Create the pipeline
     pipeline = create_pipeline(
-        system_prompt=args.system_prompt,
+        system_prompt=system_prompt,
         hot_words=hot_words,
         enable_audio=not args.no_audio,
         enable_aec=not args.no_aec,
+        enable_metrics=args.metrics,
+        enable_debug=args.debug,
     )
+
+    # Start health check server
+    health_server = HealthCheckServer(
+        port=args.health_port,
+        status_callback=pipeline.get_status,
+    )
+    await health_server.start()
 
     # Setup graceful shutdown
     shutdown_event = asyncio.Event()
@@ -123,8 +179,12 @@ async def run_pipeline(args: argparse.Namespace):
 
     try:
         await pipeline.start()
+        health_server.set_ready(True)
 
         logger.info("Pipeline running. State: %s", pipeline.state_machine.state.value)
+        logger.info("Health: http://0.0.0.0:%d/health", args.health_port)
+        if args.metrics:
+            logger.info("Metrics: http://0.0.0.0:9090/metrics")
         logger.info("Press Ctrl+C to stop.")
 
         # Main loop — wait for shutdown signal
@@ -145,20 +205,26 @@ async def run_pipeline(args: argparse.Namespace):
         logger.error("Pipeline error: %s", e, exc_info=True)
     finally:
         logger.info("Shutting down pipeline...")
+        health_server.set_ready(False)
         await pipeline.stop()
+        await health_server.stop()
         logger.info("AIOS stopped.")
 
 
 def main():
     args = parse_args()
 
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+    # Configure structured logging
+    configure_logging(
+        level="DEBUG" if args.debug else "INFO",
+        json_format=not args.debug,  # Human-readable in debug mode
+        non_blocking=True,
+    )
 
     configure_gc()
 
     logger.info("Python %s", sys.version)
-    logger.info("AIOS v0.1.0-mvp")
+    logger.info("AIOS v0.1.0-MVP")
 
     try:
         asyncio.run(run_pipeline(args))

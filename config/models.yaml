@@ -1,0 +1,27 @@
+# AIOS Model Registry
+# Specifies model versions and endpoints. Restart required for changes.
+
+asr:
+  provider: personaplex
+  version: "1.0"
+  endpoint: "localhost:50051"
+  fallback:
+    provider: whisper-tiny
+    path: "/models/whisper-tiny"
+
+slm:
+  provider: phi3-mini
+  version: "3.8b-gptq-4bit"
+  path: "/models/phi-3-mini-4k-instruct-gptq"
+  max_tokens: 512
+  cuda_stream: dedicated
+
+tts:
+  provider: riva
+  version: "2.0"
+  endpoint: "localhost:50052"
+  voice: "en-US-female-1"
+  sample_rate: 24000
+  fallback:
+    provider: vits
+    path: "/models/vits"

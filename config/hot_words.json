@@ -1,0 +1,18 @@
+[
+  {
+    "term": "PersonaPlex",
+    "phonetic_variants": ["personna plex", "persona plex", "personal plex"]
+  },
+  {
+    "term": "NVIDIA",
+    "phonetic_variants": ["en vidia", "invidia"]
+  },
+  {
+    "term": "AIOS",
+    "phonetic_variants": ["ay os", "a i o s"]
+  },
+  {
+    "term": "Riva",
+    "phonetic_variants": ["reeva", "riva"]
+  }
+]

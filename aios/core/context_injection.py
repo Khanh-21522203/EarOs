@@ -35,9 +35,11 @@ CURRENT_TURN_MAX_TOKENS = 512
 RESPONSE_RESERVED_TOKENS = 1024
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a helpful AI assistant engaged in a real-time voice conversation. "
-    "Respond naturally and concisely. Keep responses brief and conversational. "
-    "If the user's speech was interrupted or unclear, ask for clarification politely."
+    "You are AIOS, a conversational AI assistant. "
+    "Respond concisely and naturally in spoken English. "
+    "Keep responses under 3 sentences unless asked for detail. "
+    "The user may have a Vietnamese accent. Do not comment on pronunciation.\n"
+    "Known terms: {hot_words}"
 )
 
 CORRECTION_SYSTEM_PROMPT = (
@@ -59,7 +61,8 @@ class AssembledPrompt:
     """
     The fully assembled prompt ready for SLM inference.
 
-    Includes token counts per segment for monitoring.
+    Includes token counts per segment and versioning metadata
+    for debugging and cache invalidation.
     """
     full_prompt: str
     system_prompt_tokens: int
@@ -68,6 +71,10 @@ class AssembledPrompt:
     total_tokens: int
     assembly_time_ms: float
     hot_words_injected: int = 0
+    # Prompt versioning metadata (context-injection.md Section 7)
+    turn_id: int = 0
+    prompt_version: int = 1
+    context_hash: str = ""
 
 
 class ContextInjectionEngine:
@@ -111,6 +118,9 @@ class ContextInjectionEngine:
         self._hot_words: List[HotWord] = hot_words or []
         self._hot_word_text = self._format_hot_words()
 
+        # Prompt versioning
+        self._prompt_version: int = 1
+
         # Metrics
         self._total_assemblies: int = 0
         self._total_truncations: int = 0
@@ -122,9 +132,10 @@ class ContextInjectionEngine:
         )
 
     def set_system_prompt(self, prompt: str):
-        """Update the system prompt."""
+        """Update the system prompt. Increments prompt_version."""
         self._system_prompt = prompt
         self._system_prompt_tokens = estimate_token_count(prompt)
+        self._prompt_version += 1
 
     def set_hot_words(self, hot_words: List[HotWord]):
         """Update the hot-word list (takes effect on next assembly)."""
@@ -136,6 +147,7 @@ class ContextInjectionEngine:
         self,
         current_turn_text: str,
         is_correction: bool = False,
+        turn_id: int = 0,
     ) -> AssembledPrompt:
         """
         Assemble the full prompt for SLM inference.
@@ -151,12 +163,12 @@ class ContextInjectionEngine:
         self._total_assemblies += 1
 
         if is_correction:
-            return self._assemble_correction_prompt(current_turn_text, start_time)
+            return self._assemble_correction_prompt(current_turn_text, start_time, turn_id)
         else:
-            return self._assemble_response_prompt(current_turn_text, start_time)
+            return self._assemble_response_prompt(current_turn_text, start_time, turn_id)
 
     def _assemble_response_prompt(
-        self, current_turn_text: str, start_time: float
+        self, current_turn_text: str, start_time: float, turn_id: int = 0,
     ) -> AssembledPrompt:
         """Assemble a response generation prompt."""
         current_turn_tokens = estimate_token_count(current_turn_text)
@@ -183,18 +195,17 @@ class ContextInjectionEngine:
         # Build the prompt parts
         parts = []
 
-        # System prompt section
+        # System prompt section (interpolate hot-words per context-injection.md §2)
         parts.append("[SYSTEM]")
-        parts.append(self._system_prompt)
-        if self._hot_word_text:
-            parts.append("Known terms: " + self._hot_word_text)
+        system_prompt_rendered = self._system_prompt.format(
+            hot_words=self._hot_word_text or "(none)"
+        )
+        parts.append(system_prompt_rendered)
         parts.append("[/SYSTEM]")
 
-        # Context turns
+        # Context turns (formatted per memory-and-persistence.md Section 4)
         for turn in context_window.turns:
-            role_label = "User" if turn.role == "user" else "Assistant"
-            suffix = " [interrupted]" if turn.interrupted else ""
-            parts.append("[%s]%s %s" % (role_label, suffix, turn.text))
+            parts.append(turn.format_for_context())
 
         # Current user turn
         parts.append("[User] " + current_turn_text)
@@ -211,6 +222,8 @@ class ContextInjectionEngine:
 
         assembly_time_ms = (time.time() - start_time) * 1000
 
+        ctx_hash = self._context_manager.context_hash()
+
         return AssembledPrompt(
             full_prompt=full_prompt,
             system_prompt_tokens=self._system_prompt_tokens,
@@ -219,10 +232,13 @@ class ContextInjectionEngine:
             total_tokens=total_tokens,
             assembly_time_ms=assembly_time_ms,
             hot_words_injected=len(self._hot_words),
+            turn_id=turn_id,
+            prompt_version=self._prompt_version,
+            context_hash=ctx_hash,
         )
 
     def _assemble_correction_prompt(
-        self, raw_asr_text: str, start_time: float
+        self, raw_asr_text: str, start_time: float, turn_id: int = 0,
     ) -> AssembledPrompt:
         """Assemble a correction prompt for accent error fixing."""
         correction_tokens = estimate_token_count(CORRECTION_SYSTEM_PROMPT)
@@ -261,6 +277,9 @@ class ContextInjectionEngine:
             total_tokens=total_tokens,
             assembly_time_ms=assembly_time_ms,
             hot_words_injected=len(self._hot_words),
+            turn_id=turn_id,
+            prompt_version=self._prompt_version,
+            context_hash=self._context_manager.context_hash(),
         )
 
     def _format_hot_words(self) -> str:

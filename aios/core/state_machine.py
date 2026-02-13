@@ -16,6 +16,14 @@ from enum import Enum
 
 logger = logging.getLogger(__name__)
 
+# Per-state watchdog timeouts (seconds) from turn-taking.md
+STATE_TIMEOUTS: Dict[str, float] = {
+    "LISTENING": 10.0,
+    "PROCESSING": 5.0,
+    "SPEAKING": 30.0,
+    "INTERRUPTED": 0.5,
+}
+
 
 class ConversationState(Enum):
     """Conversational states for the AIOS state machine."""
@@ -31,11 +39,13 @@ class EventType(Enum):
     SPEECH_START = "speech_start"
     SPEECH_END = "speech_end"
     FIRST_TOKEN = "first_token"
+    FIRST_TTS_FRAME = "first_tts_frame"
     PLAYBACK_COMPLETE = "playback_complete"
     BARGE_IN = "barge_in"
     RESPONSE_COMPLETE = "response_complete"
-    RESUME_SPEAKING = "resume_speaking"
-    USER_CONTINUES = "user_continues"
+    INTERRUPT_COMPLETE = "interrupt_complete"
+    TURN_TIMEOUT = "turn_timeout"
+    PROCESSING_TIMEOUT = "processing_timeout"
     WATCHDOG_TIMEOUT = "watchdog_timeout"
     SHUTDOWN = "shutdown"
 
@@ -44,25 +54,33 @@ class EventType(Enum):
 class Event:
     """An event published to the event bus."""
     type: EventType
-    timestamp: float = field(default_factory=time.time)
+    timestamp: float = field(default_factory=time.monotonic)
     turn_id: int = 0
-    data: Optional[dict] = None
+    metadata: Optional[dict] = None
 
     def __repr__(self) -> str:
         return f"Event({self.type.value}, turn={self.turn_id})"
 
 
 # Valid state transitions: (current_state, event) -> next_state
+# From turn-taking.md Section 3
 VALID_TRANSITIONS: Dict[tuple[ConversationState, EventType], ConversationState] = {
+    # Happy path
     (ConversationState.IDLE, EventType.SPEECH_START): ConversationState.LISTENING,
     (ConversationState.LISTENING, EventType.SPEECH_END): ConversationState.PROCESSING,
+    (ConversationState.PROCESSING, EventType.FIRST_TTS_FRAME): ConversationState.SPEAKING,
     (ConversationState.PROCESSING, EventType.FIRST_TOKEN): ConversationState.SPEAKING,
     (ConversationState.PROCESSING, EventType.RESPONSE_COMPLETE): ConversationState.IDLE,
     (ConversationState.SPEAKING, EventType.PLAYBACK_COMPLETE): ConversationState.IDLE,
+    # Barge-in
     (ConversationState.SPEAKING, EventType.BARGE_IN): ConversationState.INTERRUPTED,
-    (ConversationState.INTERRUPTED, EventType.RESUME_SPEAKING): ConversationState.SPEAKING,
-    (ConversationState.INTERRUPTED, EventType.USER_CONTINUES): ConversationState.LISTENING,
-    # Watchdog can force any state to IDLE
+    (ConversationState.INTERRUPTED, EventType.INTERRUPT_COMPLETE): ConversationState.LISTENING,
+    # User speaks again during processing (cancel current generation)
+    (ConversationState.PROCESSING, EventType.SPEECH_START): ConversationState.LISTENING,
+    # Timeouts
+    (ConversationState.LISTENING, EventType.TURN_TIMEOUT): ConversationState.IDLE,
+    (ConversationState.PROCESSING, EventType.PROCESSING_TIMEOUT): ConversationState.IDLE,
+    # Watchdog can force any non-IDLE state to IDLE
     (ConversationState.LISTENING, EventType.WATCHDOG_TIMEOUT): ConversationState.IDLE,
     (ConversationState.PROCESSING, EventType.WATCHDOG_TIMEOUT): ConversationState.IDLE,
     (ConversationState.SPEAKING, EventType.WATCHDOG_TIMEOUT): ConversationState.IDLE,
@@ -169,7 +187,7 @@ class StateMachine:
         # State
         self._state = ConversationState.IDLE
         self._turn_id: int = 0
-        self._state_entered_at: float = time.time()
+        self._state_entered_at: float = time.monotonic()
 
         # History
         self._transition_history: List[StateTransitionRecord] = []
@@ -254,7 +272,7 @@ class StateMachine:
 
     async def _handle_event(self, event: Event):
         """Handle a single event — attempt state transition."""
-        start_time = time.time()
+        start_time = time.monotonic()
 
         if event.type == EventType.SHUTDOWN:
             self._running = False
@@ -274,7 +292,7 @@ class StateMachine:
 
         # Execute transition
         old_state = self._state
-        now = time.time()
+        now = time.monotonic()
         duration_ms = (now - self._state_entered_at) * 1000
 
         self._state = new_state
@@ -299,7 +317,7 @@ class StateMachine:
             self._transition_history.pop(0)
 
         # Log transition
-        elapsed_ms = (time.time() - start_time) * 1000
+        elapsed_ms = (time.monotonic() - start_time) * 1000
         logger.info(
             f"State transition: {old_state.value} -> {new_state.value} "
             f"[event={event.type.value}, turn={self._turn_id}, "
@@ -330,26 +348,38 @@ class StateMachine:
                 logger.error(f"Flush callback error: {e}")
 
     async def _watchdog_loop(self):
-        """Watchdog timer — forces IDLE if stuck in any state too long."""
+        """Watchdog timer — per-state timeouts from turn-taking.md Section 7."""
         try:
             while self._running:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.25)
 
                 if self._state == ConversationState.IDLE:
                     continue
 
-                elapsed = time.time() - self._state_entered_at
-                if elapsed > self._watchdog_timeout:
+                elapsed = time.monotonic() - self._state_entered_at
+                state_name = self._state.value
+                timeout = STATE_TIMEOUTS.get(state_name, self._watchdog_timeout)
+
+                if elapsed > timeout:
+                    # Choose the appropriate timeout event type
+                    if self._state == ConversationState.LISTENING:
+                        event_type = EventType.TURN_TIMEOUT
+                    elif self._state == ConversationState.PROCESSING:
+                        event_type = EventType.PROCESSING_TIMEOUT
+                    elif self._state == ConversationState.INTERRUPTED:
+                        event_type = EventType.INTERRUPT_COMPLETE
+                    else:
+                        event_type = EventType.WATCHDOG_TIMEOUT
+
                     logger.error(
-                        f"Watchdog timeout! Stuck in {self._state.value} "
-                        f"for {elapsed:.1f}s (limit: {self._watchdog_timeout}s). "
-                        f"Forcing transition to IDLE."
+                        f"Watchdog timeout! Stuck in {state_name} "
+                        f"for {elapsed:.1f}s (limit: {timeout}s). "
+                        f"Emitting {event_type.value}."
                     )
-                    watchdog_event = Event(
-                        type=EventType.WATCHDOG_TIMEOUT,
+                    await self._event_bus.publish(Event(
+                        type=event_type,
                         turn_id=self._turn_id,
-                    )
-                    await self._event_bus.publish(watchdog_event)
+                    ))
         except asyncio.CancelledError:
             logger.debug("Watchdog loop cancelled")
 
@@ -360,7 +390,7 @@ class StateMachine:
             "turn_id": self._turn_id,
             "total_transitions": self._total_transitions,
             "invalid_transitions": self._invalid_transition_count,
-            "time_in_current_state_ms": (time.time() - self._state_entered_at) * 1000,
+            "time_in_current_state_ms": (time.monotonic() - self._state_entered_at) * 1000,
             "event_bus_depth": self._event_bus.depth,
             "event_bus_total_published": self._event_bus.total_published,
             "event_bus_total_dropped": self._event_bus.total_dropped,
